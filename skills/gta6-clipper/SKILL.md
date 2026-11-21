@@ -1,25 +1,25 @@
 ---
 name: gta6-clipper
-description: GTA 6 Clipper. Turns GTA 6 streams into ready-to-post vertical clips (facecam on top, gameplay below, hook title, word-by-word captions, post caption + hashtags). Activates on "set up the GTA 6 clipper", "clip this stream <link>", "find me today's biggest GTA 6 streams and clip them", /gta6-clipper, /clip, or any request to clip a YouTube, Twitch or Kick stream. Downloads audio only, transcribes on the Mac, marks loud moments and chat spikes, the Claude session itself reads the transcript 12 minutes at a time and scores moments (no API keys), then downloads only the needed minutes and renders 3 clips per stream. Works on a Claude subscription or free via Ollama (ollama launch claude). Mac only.
+description: GTA 6 Clipper for GitHub Copilot (Windows). Turns GTA 6 streams into ready-to-post vertical clips (facecam on top, gameplay below, hook title, word-by-word captions, post caption + hashtags). Activates on "set up the GTA 6 clipper", "clip this stream <link>", "find me today's biggest GTA 6 streams and clip them", /gta6-clipper, /clip, or any request to clip a YouTube, Twitch or Kick stream. Downloads audio only, transcribes on the PC via faster-whisper, marks loud moments and chat spikes, the GitHub Copilot session itself reads the transcript 12 minutes at a time and scores moments (no extra API keys), then downloads only the needed minutes and renders 3 clips per stream. Windows edition (Windows 10/11, 64-bit).
 ---
 
-# GTA 6 Clipper
+# GTA 6 Clipper (GitHub Copilot - Windows Edition)
 
 Stream link (YouTube, Twitch, Kick) or nothing -> 3 ready-to-post 1080x1920 clips per stream.
-Everything except the picking runs on this Mac. The picking is done by YOU (this Claude Code session),
-so it runs on the user's Claude subscription, or on a local model through Ollama. No API keys.
+Everything except the picking runs locally on this PC. The picking is done by YOU (this GitHub Copilot session),
+so it runs directly on the user's GitHub Copilot session. No separate API keys needed.
 
-`S` = this skill's folder. Always run Python through the skill's venv:
-`"$S/.venv/bin/python" "$S/scripts/gta6clip.py" ...`. Quote paths (they may contain spaces).
+`S` = this skill's folder (e.g. `<workspace>/skills/gta6-clipper`, `%USERPROFILE%\.copilot\skills\gta6-clipper`, or `%USERPROFILE%\.github\skills\gta6-clipper`).
+Always run Python through the skill's venv:
+- On Windows: `"$S/.venv/Scripts/python.exe" "$S/scripts/gta6clip.py" ...`
+- On WSL/Linux/macOS fallback: `"$S/.venv/bin/python" "$S/scripts/gta6clip.py" ...`
+Quote paths (they often contain spaces). Forward slashes work in both Git Bash and PowerShell.
 
 ## 0. "Set up the GTA 6 clipper"
 
-On Windows this Mac version will not work: tell the user to install the Windows version
-(https://github.com/vossashtonai/gta6-clipper-windows, one PowerShell command:
-`irm https://raw.githubusercontent.com/vossashtonai/gta6-clipper-windows/main/install.ps1 | iex`).
-
-Run `bash "$S/scripts/setup.sh"`. It checks Homebrew, ffmpeg, whisper-cpp, deno, uv, the Python venv
-(yt-dlp, OpenCV, Pillow), the Whisper model and the face detector, installs what's missing and prints
+Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$S/scripts/setup.ps1"` (use a timeout/initial_wait of 600s;
+first run downloads ~800 MB). It checks FFmpeg, Deno, uv, the Python venv (yt-dlp, faster-whisper, OpenCV,
+Pillow), the Whisper model and the face detector, installs what's missing (no admin needed) and prints
 READY or what is still missing. Tell the user in plain words what was installed and that it's ready.
 If any command later says "Not set up yet", run setup first. Re-run setup if YouTube downloads start
 failing (it updates yt-dlp).
@@ -29,10 +29,11 @@ failing (it updates yt-dlp).
 - Given links: `prep <url> [<url> ...]`
 - Given nothing ("find today's biggest GTA 6 streams"): run `discover` (default 7 streams, `--limit N`),
   show the list, then `prep` all of the URLs it printed. Don't wait for approval unless the user asked to choose.
-- Age-restricted YouTube streams (common with GTA) and Kick need the browser login: add `--cookies chrome`
-  (or safari/firefox). If a download fails with "Sign in to confirm your age" / 403, retry with it.
-- `--jobs 2` (default) preps 2 streams at once. Don't go higher on a 16 GB Mac.
-- Long streams take a while (4 h stream: a few min download + ~8-12 min transcript). Run prep in the
+- Age-restricted YouTube streams (common with GTA) and Kick need the browser login: add `--cookies firefox`.
+  On Windows Chrome/Edge cookies usually can't be read while the browser is open (Chrome encrypts them):
+  use Firefox, or a `cookies.txt` exported with a browser extension (`--cookies C:/path/cookies.txt`). If a download fails with "Sign in to confirm your age" / 403, retry with it.
+- `--jobs 2` (default) preps 2 streams at once. Don't go higher on a 16 GB PC.
+- Long streams take a while (4 h stream: a few min download + ~10-25 min transcript, depends on the CPU). Run prep in the
   background for 2+ streams and tell the user it's running.
 
 Prep downloads only the audio, transcribes it locally, marks where the streamer got loud and (YouTube
@@ -48,9 +49,9 @@ Read `references/picking.md` first, every time. Then for each run folder:
    nothing qualifies. Write the file even when it's empty: that's how progress is tracked.
 3. `status <run>` shows which chunks still have no picks file. Keep going until `chunks_left` is empty.
 
-Multiple streams: give each stream its own subagent (Agent tool, general-purpose) with the run folder path
+Multiple streams: if subagents (`task` / `runSubagent` tool) are available, give each stream its own subagent with the run folder path
 and the instruction "read references/picking.md, then do step 3 of SKILL.md for this run folder". Up to 4 at
-once. If you're running on a local Ollama model, skip subagents and do the streams one after another.
+once. Otherwise, process the streams one after another.
 
 ## 4. Make the clips
 
@@ -62,12 +63,12 @@ writes `clips/clip_NN_<title>.mp4` + `clip_NN_<title>.txt` (title, post caption,
 - If fewer than 3 clips came out because scores were low, say so; offer `--min-score 6` rather than
   quietly lowering the bar.
 - Pass the same `--cookies` as prep if the stream needed it (it's remembered in stream.json).
-- Render streams one after another (each uses ffmpeg + whisper on a short piece; fast).
+- Render streams one after another (each uses ffmpeg + faster-whisper on a short piece; fast).
 
 ## 5. Report
 
 Per stream: stream length -> moments found -> clips kept, total time, and each clip's title, timestamp,
-length, layout (facecam / cam / gameplay) and file path. Open the clips folder with `open "<run>/clips"`.
+length, layout (facecam / cam / gameplay) and file path. Open the clips folder with `explorer.exe "<run>\clips"` (Windows path, backslashes).
 Remind the user: watch every clip before posting, and only clip streamers who are fine with clipping.
 
 ## Other requests
@@ -82,8 +83,10 @@ Remind the user: watch every clip before posting, and only clip streamers who ar
 - Disk: prep deletes the audio after transcribing and render deletes downloaded sections (`--keep` keeps
   them). Runs live in `~/GTA6-Clips/` (or `$GTA6_CLIPS_DIR`); delete finished ones only if the user says so.
 
-## Free mode (no subscription)
+## Windows notes
 
-Same skill, same prompts. The user installs Ollama, pulls a model sized to their MEMORY (Apple menu ->
-About This Mac -> Memory): 16 GB -> `qwen3.5:9b`, 32 GB+ -> `qwen3.5:27b`, then runs `ollama launch claude`
-and picks the model. Be honest if asked: it's slower and the picks are rougher than Claude's.
+- Setup installs into the skill folder (`.venv`, `models`, and `bin/ffmpeg` if winget isn't there). It records
+  the tool paths in `config.json`, so it works right away without restarting VS Code or the terminal.
+- Speech to text is faster-whisper on the CPU. An NVIDIA GPU with CUDA 12 + cuDNN can be used with
+  `GTA6_WHISPER_DEVICE=cuda GTA6_WHISPER_COMPUTE=float16` (optional; CPU is the safe default).
+- If Windows Defender / SmartScreen asks about ffmpeg, deno or uv, they're the official builds: allow them.

@@ -1,27 +1,27 @@
-# Community post: GTA 6 Clipper (copy-paste)
+# Quick Install Prompt: GTA 6 Clipper for Windows (GitHub Copilot)
 
-**Title:** GTA 6 Clipper: free Claude Code skills (finished + live)
+**1. Open PowerShell in this repository and run:**
 
-Here are both GTA 6 clipper skills from the video. Free, Mac only.
-
-**1. Open Claude Code and paste this:**
-
-```text
-Install the GTA 6 Clipper skills from https://github.com/vossashtonai/gta6-clipper.
-Clone the repo to a temporary folder, then copy BOTH folders inside its skills/ folder
-(gta6-clipper and gta6-live-clipper) into ~/.claude/skills/ so they sit side by side.
-Then run: bash ~/.claude/skills/gta6-clipper/scripts/setup.sh
-Tell me what it installed and whether it says READY. Then remind me to restart Claude Code.
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-**2. Restart Claude Code, then say one of these:**
+Wait until it says `READY` (first time takes 5 to 10 minutes as it downloads ~800 MB).
 
-- clip this stream [paste link]
-- find me today's biggest GTA 6 streams and clip them
-- live clip [paste link of a stream that's live right now]
+**2. Or paste this directly into GitHub Copilot Chat (Agent mode):**
 
-Your clips land in a folder called GTA6-Clips in your home folder, each with a caption and hashtags ready to post.
+```text
+Set up the GTA 6 Clipper for Windows in this repository.
+Run: powershell -NoProfile -ExecutionPolicy Bypass -File "skills/gta6-clipper/scripts/setup.ps1"
+(use a 10 minute timeout, the first run downloads about 800 MB).
+Tell me what it installed and whether it says READY.
+```
 
-**No Claude subscription?** The README on GitHub shows how to run it free with Ollama.
+**3. Then say one of these in GitHub Copilot Chat or Copilot CLI:**
 
-Drop your first clip in the comments 👇
+- `clip this stream [paste link]` (or `/clip [paste link]`)
+- `find me today's biggest GTA 6 streams and clip them` (or `/discover-and-clip`)
+- `live clip [paste link of a stream that's live right now]` (or `/live-clip [paste link]`)
+
+Your clips land in `C:\Users\<you>\GTA6-Clips`, each with a caption and hashtags ready to post.
+

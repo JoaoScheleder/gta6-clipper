@@ -8,8 +8,8 @@
   stop RUN [RUN...]    stop recording (buffer is cleaned up; clips stay)
 
 The recorder (hidden `_daemon` command) keeps 1-minute video segments for --buffer-min minutes,
-transcribes each one on this Mac as it lands, tracks loudness and (Twitch) chat speed, and writes
-windows/window_NNN.md every --window-min minutes. Claude reads each window and writes
+transcribes each one on this PC as it lands, tracks loudness and (Twitch) chat speed, and writes
+windows/window_NNN.md every --window-min minutes. GitHub Copilot reads each window and writes
 picks/window_NNN.json (same format as the VOD clipper). Shares the gta6-clipper engine + venv.
 """
 import argparse, csv, json, os, random, signal, socket, statistics, subprocess, sys, threading, time
@@ -30,15 +30,50 @@ def log(*a):
 
 def jload(p, default):
     try:
-        return json.loads(Path(p).read_text())
+        return json.loads(Path(p).read_text(encoding="utf-8"))
     except Exception:
         return default
 
 
 def jsave(p, obj):
     tmp = Path(str(p) + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=1))
-    tmp.replace(p)
+    tmp.write_text(json.dumps(obj, indent=1), encoding="utf-8")
+    for i in range(20):  # Windows refuses the swap while another process is reading the file: retry
+        try:
+            tmp.replace(p)
+            return
+        except PermissionError:
+            time.sleep(0.05 * (i + 1))
+    Path(p).write_text(tmp.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def pid_alive(pid):
+    """os.kill(pid, 0) is NOT safe on Windows (signal 0 = Ctrl+C). Ask the kernel instead."""
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    code = ctypes.c_ulong()
+    ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+    k.CloseHandle(h)
+    return bool(ok) and code.value == 259  # STILL_ACTIVE
+
+
+def kill_tree(proc):
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
+                       creationflags=g.NO_WINDOW)
+    else:
+        proc.terminate()
 
 
 # ================================================================ daemon (runs in background)
@@ -74,8 +109,10 @@ class Daemon:
               str(self.seg_dir / "seg_%05d.ts")]
         self.t0_wall = time.time()
         self.save_state(recording=True, started_wall=self.t0_wall)
-        yt = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=open(self.rd / "ytdlp.log", "ab"))
-        ffp = subprocess.Popen(ff, stdin=yt.stdout, stderr=open(self.rd / "ffmpeg.log", "ab"))
+        yt = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=open(self.rd / "ytdlp.log", "ab"),
+                              creationflags=g.NO_WINDOW)
+        ffp = subprocess.Popen(ff, stdin=yt.stdout, stderr=open(self.rd / "ffmpeg.log", "ab"),
+                               creationflags=g.NO_WINDOW)
         yt.stdout.close()
         self.procs = [yt, ffp]
         ffp.wait()
@@ -125,7 +162,7 @@ class Daemon:
         rows = []
         p = self.rd / "segs.csv"
         if p.exists():
-            for r in csv.reader(p.read_text().splitlines()):
+            for r in csv.reader(p.read_text(encoding="utf-8").splitlines()):
                 if len(r) >= 3:
                     rows.append((r[0], float(r[1]), float(r[2])))
         # ffmpeg writes cumulative times; normalise to stream time from the first segment
@@ -179,7 +216,7 @@ class Daemon:
                 tags = [f"LOUD(+{e['db']:.0f}dB)" for e in self.loud if e["start"] <= s["end"] and e["end"] + 1 >= s["start"]][:1]
                 tags += [f"CHAT x{e['x']}" for e in chat if e["start"] - 15 <= s["end"] and e["end"] >= s["start"]][:1]
                 lines.append(f"[{g.hms(s['start'])}] {s['text']}" + (f"   <<{' '.join(tags)}>>" if tags else ""))
-            (self.rd / "windows" / f"window_{k + 1:03d}.md").write_text("\n".join(lines) + "\n")
+            (self.rd / "windows" / f"window_{k + 1:03d}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
             k += 1
             self.save_state(windows=k)
 
@@ -192,7 +229,7 @@ class Daemon:
             lines = [f"# LIVE {self.cfg.get('streamer')}: {self.cfg.get('title')}",
                      f"Window {k + 1} (final, {g.hms(a)} to {g.hms(b)})", ""]
             lines += [f"[{g.hms(s['start'])}] {s['text']}" for s in self.transcript if a < s["end"] and s["start"] < b]
-            (self.rd / "windows" / f"window_{k + 1:03d}.md").write_text("\n".join(lines) + "\n")
+            (self.rd / "windows" / f"window_{k + 1:03d}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
             self.save_state(windows=k + 1)
 
     def cleanup_buffer(self, newest_end):
@@ -200,7 +237,10 @@ class Daemon:
         held = jload(self.rd / "hold.json", [])  # [start,end] ranges the clip step still needs
         for f, s, e in self.segments():
             if e < keep_from and not any(e >= h[0] and s <= h[1] for h in held):
-                (self.seg_dir / f).unlink(missing_ok=True)
+                try:
+                    (self.seg_dir / f).unlink(missing_ok=True)
+                except OSError:
+                    pass  # a clip render has it open right now (Windows file lock): delete it next pass
 
     def run(self):
         threading.Thread(target=self.record, daemon=True).start()
@@ -208,6 +248,8 @@ class Daemon:
         signal.signal(signal.SIGTERM, lambda *_: self.shutdown())
         time.sleep(5)
         while True:
+            if (self.rd / "stop").exists() and not getattr(self, "stopping", False):
+                self.stopping = self.shutdown()  # False until the recorder has actually started
             rows = self.segments()
             meta = jload(self.rd / "segments.json", {})
             for f, s, e in rows:
@@ -231,11 +273,20 @@ class Daemon:
             time.sleep(5)
 
     def shutdown(self):
-        for p in getattr(self, "procs", []):
-            try:
-                p.terminate()
-            except Exception:
-                pass
+        """Stop yt-dlp; ffmpeg then sees the end of its input and closes the last segment cleanly."""
+        procs = getattr(self, "procs", [])
+        if not procs:
+            return False
+        try:
+            kill_tree(procs[0])
+            procs[1].wait(timeout=15)
+        except Exception:
+            for p in procs:
+                try:
+                    kill_tree(p)
+                except Exception:
+                    pass
+        return True
 
 
 # ================================================================ CLI
@@ -257,10 +308,23 @@ def cmd_start(a):
                                    "title": meta.get("title"), "cookies": a.cookies, "quality": a.quality,
                                    "buffer_min": a.buffer_min, "window_min": a.window_min})
         jsave(rd / "state.json", {"windows": 0})
-        p = subprocess.Popen([sys.executable, __file__, "_daemon", str(rd)], start_new_session=True,
-                             stdout=open(rd / "daemon.log", "ab"), stderr=subprocess.STDOUT)
-        (rd / "pid").write_text(str(p.pid))
+        p = spawn_daemon([sys.executable, __file__, "_daemon", str(rd)], rd / "daemon.log")
+        (rd / "pid").write_text(str(p.pid), encoding="utf-8")
         log(f"RECORDING {streamer}: {meta.get('title')}\n  run: {rd}")
+
+
+def spawn_daemon(cmd, logf):
+    """Background recorder that outlives this command and never opens a console window."""
+    out = open(logf, "ab")
+    if os.name != "nt":
+        return subprocess.Popen(cmd, start_new_session=True, stdout=out, stderr=subprocess.STDOUT)
+    base = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    try:  # break out of the terminal's job so closing it doesn't kill the recorder
+        return subprocess.Popen(cmd, creationflags=base | 0x01000000, stdout=out, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL)
+    except OSError:
+        return subprocess.Popen(cmd, creationflags=base, stdout=out, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL)
 
 
 def pending_windows(rd):
@@ -277,7 +341,7 @@ def cmd_next(a):
             if pw:
                 w = pw[0]
                 log(f"RUN: {rd}\nWINDOW: {w.name}  ->  write {rd / 'picks' / (w.stem + '.json')}\n")
-                log(w.read_text())
+                log(w.read_text(encoding="utf-8"))
                 return
         if all(jload(rd / "state.json", {}).get("ended") for rd in runs):
             log("STREAM ENDED: no more windows. Run clip one last time, then report.")
@@ -318,7 +382,7 @@ def cmd_clip(a):
             work = rd / f"work_{n:02d}"
             work.mkdir(exist_ok=True)
             lst = work / "segs.txt"
-            lst.write_text("".join(f"file '{(rd / 'buffer' / f).resolve()}'\n" for _, _, f in need))
+            lst.write_text("".join(f"file '{(rd / 'buffer' / f).resolve().as_posix()}'\n" for _, _, f in need), encoding="utf-8")
             src = work / "src.ts"
             g.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(src)])
             try:
@@ -338,12 +402,10 @@ def cmd_status(a):
         rd = Path(r)
         st, info = jload(rd / "state.json", {}), jload(rd / "stream.json", {})
         rendered = [x for x in jload(rd / "rendered.json", []) if not x.get("skipped")]
-        alive = False
         try:
-            os.kill(int((rd / "pid").read_text()), 0)
-            alive = True
+            alive = pid_alive(int((rd / "pid").read_text(encoding="utf-8")))
         except Exception:
-            pass
+            alive = False
         log(json.dumps({"run": str(rd), "streamer": info.get("streamer"), "recorder_running": alive,
                         "recorded": g.hms(st.get("covered", 0)), "windows": st.get("windows", 0),
                         "windows_waiting_for_picks": [w.name for w in pending_windows(rd)],
@@ -351,18 +413,23 @@ def cmd_status(a):
 
 
 def cmd_stop(a):
+    """Drop a stop file: the recorder ends yt-dlp, lets ffmpeg close the last segment, writes the last window."""
     for r in a.runs:
         rd = Path(r)
         try:
-            os.killpg(int((rd / "pid").read_text()), signal.SIGTERM)
-            log(f"stopping {rd.name} (last window is written once the recorder closes)")
-        except Exception as e:
-            log(f"{rd.name}: not running ({e})")
+            pid = int((rd / "pid").read_text(encoding="utf-8"))
+        except Exception:
+            pid = None
+        if not pid or not pid_alive(pid):
+            log(f"{rd.name}: not running")
+            continue
+        (rd / "stop").write_text(time.ctime(), encoding="utf-8")
+        log(f"stopping {rd.name} (last window is written once the recorder closes)")
 
 
 def main():
     if not (VOD / ".ready").exists():
-        sys.exit(f"Set up the GTA 6 clipper first: bash '{VOD}/scripts/setup.sh'")
+        sys.exit(f"Set up the GTA 6 clipper first: powershell -NoProfile -ExecutionPolicy Bypass -File \"{VOD / 'scripts' / 'setup.ps1'}\"")
     p = argparse.ArgumentParser()
     sp = p.add_subparsers(dest="cmd", required=True)
     s = sp.add_parser("start"); s.add_argument("urls", nargs="+"); s.add_argument("--cookies")

@@ -1,0 +1,51 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Setup GTA 6 Clipper (Windows)",
+      "type": "shell",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/skills/gta6-clipper/scripts/setup.ps1"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Discover GTA 6 Streams",
+      "type": "shell",
+      "command": "${workspaceFolder}/skills/gta6-clipper/.venv/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/skills/gta6-clipper/scripts/gta6clip.py",
+        "discover"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run Smoke Test",
+      "type": "shell",
+      "command": "${workspaceFolder}/skills/gta6-clipper/.venv/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/tests/smoke.py"
+      ],
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

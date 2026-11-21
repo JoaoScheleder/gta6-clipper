@@ -1,9 +1,12 @@
 .venv/
 models/
+bin/
 runs/
+realworld-out/
 .env
 .ready
 config.json
 __pycache__/
 .DS_Store
 *.zip
+

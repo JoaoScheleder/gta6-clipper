@@ -9,16 +9,29 @@
                       find the facecam, stack facecam over gameplay, hook + word captions,
                       post caption + hashtags
 
-Step 3 (picking) is done by the Claude Code session itself (no API keys); see SKILL.md.
-Run with the skill's venv:  .venv/bin/python scripts/gta6clip.py <command>
+Step 3 (picking) is done by the GitHub Copilot session itself (no API keys); see SKILL.md.
+Windows edition. Run with the skill's venv:  .venv\\Scripts\\python.exe scripts\\gta6clip.py <command>
 """
 import argparse, concurrent.futures as cf, datetime as dt, json, math, os, re, shutil
-import statistics, subprocess, sys, time, urllib.request
+import statistics, subprocess, sys, threading, time, urllib.request
 from pathlib import Path
 
 SKILL = Path(__file__).resolve().parent.parent
 RUNS = Path(os.environ.get("GTA6_CLIPS_DIR", Path.home() / "GTA6-Clips"))
-CFG = json.loads((SKILL / "config.json").read_text()) if (SKILL / "config.json").exists() else {}
+CFG = json.loads((SKILL / "config.json").read_text(encoding="utf-8-sig")) if (SKILL / "config.json").exists() else {}
+
+# Windows: print UTF-8 (stream titles have emoji), make yt-dlp child processes UTF-8 too, and put the
+# tools setup.ps1 installed (ffmpeg, deno) on PATH even before the terminal is restarted.
+for _st in (sys.stdout, sys.stderr):
+    if hasattr(_st, "reconfigure"):
+        _st.reconfigure(encoding="utf-8", errors="replace")
+os.environ["PYTHONUTF8"] = "1"
+os.environ["PYTHONIOENCODING"] = "utf-8"
+_pd = CFG.get("path_dirs") or []
+for _d in reversed([_pd] if isinstance(_pd, str) else _pd):
+    if _d and _d not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _d + os.pathsep + os.environ.get("PATH", "")
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # no console windows popping up for ffmpeg
 CHUNK_SEC = 12 * 60
 YTDLP = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--quiet", "--no-progress"]
 GTA_RE = re.compile(r"\bgta\s*(6|vi)\b|grand theft auto\s*(6|vi)\b", re.I)
@@ -30,7 +43,8 @@ def log(*a):
 
 
 def run(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    kw.setdefault("creationflags", NO_WINDOW)
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **kw)
 
 
 def cookie_args(c):
@@ -71,7 +85,7 @@ def load_env():
     env = {}
     f = SKILL / ".env"
     if f.exists():
-        for line in f.read_text().splitlines():
+        for line in f.read_text(encoding="utf-8").splitlines():
             if "=" in line and not line.strip().startswith("#"):
                 k, v = line.split("=", 1)
                 env[k.strip()] = v.strip().strip('"')
@@ -151,7 +165,7 @@ def cmd_discover(a):
             picked.append(s)
     picked = picked[: a.limit]
     RUNS.mkdir(parents=True, exist_ok=True)
-    (RUNS / f"discover-{dt.date.today()}.json").write_text(json.dumps(picked, indent=2))
+    (RUNS / f"discover-{dt.date.today()}.json").write_text(json.dumps(picked, indent=2), encoding="utf-8")
     for i, s in enumerate(picked, 1):
         tag = "LIVE NOW, clip after it ends" if s["platform"] == "youtube" and s["live_now"] else s.get("length", "archive")
         log(f"{i}. [{s['platform']}] {s['streamer']} ({tag}) {s['title'][:80]}\n   {s['url']}")
@@ -196,7 +210,7 @@ def chat_spikes(chat_file):
     if not chat_file or not Path(chat_file).exists():
         return []
     times = []
-    with open(chat_file) as f:
+    with open(chat_file, encoding="utf-8", errors="replace") as f:
         for line in f:
             try:
                 ms = json.loads(line)["replayChatItemAction"]["videoOffsetTimeMsec"]
@@ -219,21 +233,44 @@ def chat_spikes(chat_file):
     return out
 
 
-def transcribe(wav, out_base, words=False):
-    model = CFG.get("whisper_model") or os.path.expanduser("~/.cache/whisper-cpp/ggml-small.bin")
-    cmd = ["whisper-cli", "-m", model, "-f", str(wav), "-l", "en", "-np", "-mc", "0", "-oj", "-of", str(out_base)]
-    if words:
-        cmd += ["-ml", "1", "-sow", "-ojf"]
-    r = run(cmd)
-    if r.returncode != 0:
-        raise RuntimeError("whisper failed: " + r.stderr[-400:])
-    data = json.loads(Path(f"{out_base}.json").read_text())
-    segs = []
-    for s in data.get("transcription", []):
-        txt = s.get("text", "").strip()
-        if txt:
-            segs.append({"start": s["offsets"]["from"] / 1000, "end": s["offsets"]["to"] / 1000, "text": txt})
-    return segs
+_FW, _FW_LOCK = None, threading.Lock()
+
+
+def whisper_model():
+    """faster-whisper (CTranslate2), CPU int8. Loaded once per process, shared by threads."""
+    global _FW
+    with _FW_LOCK:
+        if _FW is None:
+            from faster_whisper import WhisperModel
+            _FW = WhisperModel(CFG.get("whisper_model", "small.en"), device=os.environ.get("GTA6_WHISPER_DEVICE", "cpu"),
+                               compute_type=os.environ.get("GTA6_WHISPER_COMPUTE", "int8"), num_workers=2,
+                               download_root=CFG.get("whisper_dir"))
+    return _FW
+
+
+def transcribe(wav, out_base=None, words=False):
+    """Speech -> text on this PC. words=True returns one entry per word (for the captions)."""
+    try:
+        import wave
+        import numpy as np
+        with wave.open(str(wav), "rb") as wf:  # our wavs are always 16 kHz mono 16-bit (ffmpeg -ac 1 -ar 16000)
+            pcm = np.frombuffer(wf.readframes(wf.getnframes()), np.int16).astype(np.float32) / 32768.0
+        if pcm.size < 1600:
+            return []
+        it, _ = whisper_model().transcribe(pcm, language="en", beam_size=1 if not words else 5,
+                                           word_timestamps=words, vad_filter=True,
+                                           condition_on_previous_text=False)
+        segs = []
+        for s in it:
+            if words:
+                for w in s.words or []:
+                    if w.word.strip():
+                        segs.append({"start": w.start, "end": w.end, "text": w.word.strip()})
+            elif s.text.strip():
+                segs.append({"start": s.start, "end": s.end, "text": s.text.strip()})
+        return segs
+    except Exception as e:
+        raise RuntimeError(f"whisper failed: {e}")
 
 
 def prep_one(url, cookies, force=False):
@@ -249,7 +286,7 @@ def prep_one(url, cookies, force=False):
     info = {"url": url, "webpage_url": meta.get("webpage_url") or url, "id": meta.get("id"),
             "title": meta.get("title"), "streamer": streamer, "platform": meta.get("extractor_key"),
             "duration": meta.get("duration"), "cookies": cookies}
-    (rd / "stream.json").write_text(json.dumps(info, indent=2))
+    (rd / "stream.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
     if (rd / "transcript.json").exists() and not force:
         log(f"[{streamer}] already prepped -> {rd}")
         return {"run": str(rd), "streamer": streamer, "cached": True}
@@ -278,7 +315,7 @@ def prep_one(url, cookies, force=False):
     src.unlink(missing_ok=True)
     t_dl = time.time()
 
-    log(f"[{streamer}] 2/2 transcribing on this Mac + scanning for loud moments and chat spikes")
+    log(f"[{streamer}] 2/2 transcribing on this PC + scanning for loud moments and chat spikes")
     with cf.ThreadPoolExecutor(2) as ex:
         fs = ex.submit(transcribe, wav, rd / "whisper")
         fl = ex.submit(loud_moments, wav)
@@ -288,8 +325,8 @@ def prep_one(url, cookies, force=False):
     chat = chat_spikes(chat_file)
     wav.unlink(missing_ok=True)
     (rd / "whisper.json").unlink(missing_ok=True)
-    (rd / "transcript.json").write_text(json.dumps(segs))
-    (rd / "signals.json").write_text(json.dumps({"loud": loud, "chat": chat}, indent=1))
+    (rd / "transcript.json").write_text(json.dumps(segs), encoding="utf-8")
+    (rd / "signals.json").write_text(json.dumps({"loud": loud, "chat": chat}, indent=1), encoding="utf-8")
 
     # ---- 12-minute chunks with signal markers inline
     dur = meta.get("duration") or (segs[-1]["end"] if segs else 0)
@@ -311,10 +348,10 @@ def prep_one(url, cookies, force=False):
                     tags.append(f"CHAT x{e['x']}")
                     break
             lines.append(f"[{hms(s['start'])}] {s['text']}" + (f"   <<{' '.join(tags)}>>" if tags else ""))
-        (rd / "chunks" / f"chunk_{ci + 1:02d}.md").write_text("\n".join(lines) + "\n")
+        (rd / "chunks" / f"chunk_{ci + 1:02d}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     timing = {"prep_started": t0, "download_sec": round(t_dl - t0), "analyse_sec": round(time.time() - t_dl),
               "chunks": n, "segments": len(segs), "loud_events": len(loud), "chat_spikes": len(chat)}
-    (rd / "timing.json").write_text(json.dumps(timing, indent=1))
+    (rd / "timing.json").write_text(json.dumps(timing, indent=1), encoding="utf-8")
     log(f"[{streamer}] ready: {n} chunks, {len(loud)} loud moments, {len(chat)} chat spikes "
         f"({round(time.time() - t0)}s) -> {rd}")
     return {"run": str(rd), "streamer": streamer, "chunks": n}
@@ -334,6 +371,8 @@ def cmd_prep(a):
     log("\nRUNS:")
     for r in results:
         log(f"  {r.get('run') or ''}  {r.get('error') or ''}")
+    if results and all(r.get("error") for r in results):
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------- status
@@ -342,7 +381,7 @@ def cmd_status(a):
     chunks = sorted((rd / "chunks").glob("chunk_*.md"))
     picked = {p.stem for p in (rd / "picks").glob("chunk_*.json")}
     todo = [c.name for c in chunks if c.stem not in picked]
-    cands = sum(len(json.loads(p.read_text())) for p in (rd / "picks").glob("chunk_*.json"))
+    cands = sum(len(json.loads(p.read_text(encoding="utf-8"))) for p in (rd / "picks").glob("chunk_*.json"))
     log(json.dumps({"run": str(rd), "chunks": len(chunks), "picked_chunks": len(picked), "candidates": cands,
                     "chunks_left": todo, "clips": sorted(x.name for x in (rd / "clips").glob("*.mp4"))
                     if (rd / "clips").exists() else []}, indent=1))
@@ -350,11 +389,11 @@ def cmd_status(a):
 
 # ---------------------------------------------------------------- render (step 4)
 def select(rd, top, min_score):
-    segs = json.loads((rd / "transcript.json").read_text())
+    segs = json.loads((rd / "transcript.json").read_text(encoding="utf-8"))
     cands = []
     for p in sorted((rd / "picks").glob("chunk_*.json")):
         try:
-            for c in json.loads(p.read_text()):
+            for c in json.loads(p.read_text(encoding="utf-8")):
                 c["_s"], c["_e"] = parse_ts(c["start"]), parse_ts(c["end"])
                 cands.append(c)
         except Exception as e:
@@ -464,9 +503,12 @@ def find_facecam(video, W, H):
 
 def font(size):
     from PIL import ImageFont
-    for f in ("/System/Library/Fonts/Supplemental/Arial Black.ttf", "/System/Library/Fonts/Supplemental/Impact.ttf"):
+    fonts = Path(os.environ.get("WINDIR", r"C:\\Windows")) / "Fonts"
+    for f in (fonts / "ariblk.ttf", fonts / "impact.ttf", fonts / "arialbd.ttf",
+              "/System/Library/Fonts/Supplemental/Arial Black.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
         if Path(f).exists():
-            return ImageFont.truetype(f, size)
+            return ImageFont.truetype(str(f), size)
     return ImageFont.load_default()
 
 
@@ -553,7 +595,7 @@ def caption_frames(words, hook, seam_y, cap_y, dur, outdir):
     for p, d_ in timeline:
         body += [f"file '{p.name}'", f"duration {d_:.3f}"]
     body.append(f"file '{timeline[-1][0].name}'")
-    lst.write_text("\n".join(body) + "\n")
+    lst.write_text("\n".join(body) + "\n", encoding="utf-8")
     return lst
 
 
@@ -617,8 +659,16 @@ def render_one(rd, info, c, n, cookies, keep, local_src=None, src_start=None):
         if gw > W:
             gw, gh = W, W * bot_h / 1080
         gx, gy = (W - gw) / 2, (H - gh) / 2
-        vf = (f"[0:v]fps=30,split[a][b];"
-              f"[a]crop={cw}:{ch}:{L}:{T},scale=1080:{top_h}:force_original_aspect_ratio=increase,crop=1080:{top_h}[top];"
+        if os.environ.get("FACECAM_FIT") == "1":  # whole cam visible (zoomed out) over a blurred fill, sharpened
+            zf = float(os.environ.get("FACECAM_ZOOM", "0.9"))
+            fw_, fh_ = int(1080 * zf) // 2 * 2, int(top_h * zf) // 2 * 2
+            topf = (f"[a]crop={cw}:{ch}:{L}:{T},split[ca][cb];"
+                    f"[ca]scale=1080:{top_h}:force_original_aspect_ratio=increase,crop=1080:{top_h},boxblur=24:2,eq=brightness=-0.12[cbg];"
+                    f"[cb]scale={fw_}:{fh_}:force_original_aspect_ratio=decrease:flags=lanczos,unsharp=5:5:0.7[cfg];"
+                    f"[cbg][cfg]overlay=(W-w)/2:(H-h)/2[top];")
+        else:
+            topf = f"[a]crop={cw}:{ch}:{L}:{T},scale=1080:{top_h}:force_original_aspect_ratio=increase,crop=1080:{top_h}[top];"
+        vf = (f"[0:v]fps=30,split[a][b];" + topf +
               f"[b]crop={int(gw)}:{int(gh)}:{int(gx)}:{int(gy)},scale=1080:{bot_h}[bot];[top][bot]vstack[base]")
         seam, cap_y = top_h, top_h + int(bot_h * 0.58)
     elif fc["mode"] == "cam":
@@ -645,7 +695,7 @@ def render_one(rd, info, c, n, cookies, keep, local_src=None, src_start=None):
     post = (f"TITLE: {c.get('title', '')}\n\nCAPTION:\n{c.get('caption', '')}\n\n{tags}\n\n"
             f"Source: {info['streamer']}, {info['webpage_url']} at {hms(c['_s'])}\n"
             f"Category: {c.get('category')}  Score: {c.get('score')}  Layout: {fc['mode']}\n")
-    out.with_suffix(".txt").write_text(post)
+    out.with_suffix(".txt").write_text(post, encoding="utf-8")
     if not keep:
         shutil.rmtree(work, ignore_errors=True)
         if local_src is not None:
@@ -655,7 +705,7 @@ def render_one(rd, info, c, n, cookies, keep, local_src=None, src_start=None):
 
 def cmd_render(a):
     rd = Path(a.run)
-    info = json.loads((rd / "stream.json").read_text())
+    info = json.loads((rd / "stream.json").read_text(encoding="utf-8"))
     t0 = time.time()
     picks, total = select(rd, a.top, a.min_score)
     log(f"[{info['streamer']}] {total} possible moments -> keeping best {len(picks)}")
@@ -668,13 +718,13 @@ def cmd_render(a):
             log(f"  clip {n}: {c.get('title')}  ({hms(c['_s'])}, {round(c['_e'] - c['_s'])}s, {mode}) -> {out.name}")
         except Exception as e:
             log(f"  clip {n} FAILED: {e}")
-    tm = json.loads((rd / "timing.json").read_text()) if (rd / "timing.json").exists() else {}
+    tm = json.loads((rd / "timing.json").read_text(encoding="utf-8")) if (rd / "timing.json").exists() else {}
     tm["render_sec"] = round(time.time() - t0)
     tm["total_sec"] = round(time.time() - tm.get("prep_started", t0))
-    (rd / "timing.json").write_text(json.dumps(tm, indent=1))
+    (rd / "timing.json").write_text(json.dumps(tm, indent=1), encoding="utf-8")
     summary = {"stream": info["title"], "streamer": info["streamer"], "length": hms(info.get("duration") or 0),
                "moments_found": total, "clips": made, "total_time": hms(tm["total_sec"])}
-    (rd / "clips" / "summary.json").write_text(json.dumps(summary, indent=1))
+    (rd / "clips" / "summary.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
     log(f"\n{info['streamer']}: {summary['length']} stream -> {total} moments -> {len(made)} clips "
         f"(total {summary['total_time']}) -> {rd / 'clips'}")
 
@@ -682,13 +732,13 @@ def cmd_render(a):
 # ---------------------------------------------------------------- main
 def main():
     if not (SKILL / ".ready").exists():
-        sys.exit("Not set up yet. Run: bash scripts/setup.sh")
+        sys.exit("Not set up yet. Run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\setup.ps1")
     p = argparse.ArgumentParser()
     sp = p.add_subparsers(dest="cmd", required=True)
     d = sp.add_parser("discover"); d.add_argument("--limit", type=int, default=7)
     pr = sp.add_parser("prep"); pr.add_argument("urls", nargs="+")
-    pr.add_argument("--cookies", help="chrome / safari / firefox, or a cookies.txt path (age-restricted YouTube, Kick)")
-    pr.add_argument("--jobs", type=int, default=2, help="streams processed at once (2 is safe on a 16 GB Mac)")
+    pr.add_argument("--cookies", help="firefox / edge / chrome, or a cookies.txt path (age-restricted YouTube, Kick). On Windows firefox or cookies.txt is the reliable one")
+    pr.add_argument("--jobs", type=int, default=2, help="streams processed at once (2 is safe on a 16 GB PC)")
     pr.add_argument("--force", action="store_true")
     s = sp.add_parser("status"); s.add_argument("run")
     r = sp.add_parser("render"); r.add_argument("run")

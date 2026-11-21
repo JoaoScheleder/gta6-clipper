@@ -1,12 +1,12 @@
 {
-  "name": "ashtonvossai",
+  "name": "ashtonvossai-windows",
   "owner": { "name": "Ashton Voss AI" },
-  "description": "Free Claude Code skills from Ashton Voss AI.",
+  "description": "GTA 6 Clipper skills for Windows and GitHub Copilot.",
   "plugins": [
     {
-      "name": "gta6-clipper",
+      "name": "gta6-clipper-windows",
       "source": "./",
-      "description": "Clip GTA 6 streams into ready-to-post vertical clips, from a finished stream or live. Mac only.",
+      "description": "Clip GTA 6 streams into ready-to-post vertical clips, from a finished stream or live. Windows & GitHub Copilot edition.",
       "version": "1.0.0",
       "author": { "name": "Ashton Voss AI" },
       "category": "productivity"
